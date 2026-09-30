@@ -1,0 +1,49 @@
+# Local Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Credentials, keyrings and private runtime configuration
+.env
+.env.*
+!.env.example
+*.env
+*.key
+*.keyring
+*.kwl
+*.p12
+*.pfx
+*.kdbx
+credentials*.json
+secrets*.json
+config.local.*
+*.local.toml
+keyrings/
+private/
+
+# Personal agent state, diagnostics and temporary material
+.hermes/
+.codex/
+.agents/
+docs/superpowers/
+work/
+outputs/
+scratch/
+.cache/
+*.log
+
+# Local editor and OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
