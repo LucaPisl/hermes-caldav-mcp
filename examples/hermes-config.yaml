@@ -1,0 +1,7 @@
+# Generate the correct installed interpreter path and selected provider with print-config.
+# No URL, username, password or calendar paths belong in this file.
+mcp_servers:
+  nextcloud_calendar:
+    command: "/opt/hermes-caldav-mcp/.venv/bin/python"
+    args: ["-m", "hermes_caldav_mcp", "serve", "--profile", "default", "--keyring", "kde"]
+    timeout: 40
