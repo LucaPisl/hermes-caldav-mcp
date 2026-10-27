@@ -410,7 +410,7 @@ def test_runtime_uses_saved_wallet_and_forget_removes_only_that_wallet(
     save_choice("default", WalletChoice("kde"))
     bus.payload = json.dumps({"version": 1, "profile": asdict(profile)}).encode()
     monkeypatch.setenv("XDG_CURRENT_DESKTOP", "GNOME")
-    monkeypatch.setattr(cli, "make_server", lambda service: service)
+    monkeypatch.setattr(cli, "make_server", lambda service, **_: service)
 
     async def run(service):
         assert service.profile_loader() == profile
@@ -429,7 +429,7 @@ def test_explicit_configuration_keeps_wallet_when_preference_file_is_missing(
 ):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     bus.payload = json.dumps({"version": 1, "profile": asdict(profile)}).encode()
-    monkeypatch.setattr(cli, "make_server", lambda service: service)
+    monkeypatch.setattr(cli, "make_server", lambda service, **_: service)
 
     async def run(service):
         assert service.profile_loader() == profile

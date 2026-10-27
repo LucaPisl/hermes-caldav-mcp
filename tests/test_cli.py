@@ -326,3 +326,91 @@ def test_discovery_deadline_can_be_retried_without_reentering_password(
     assert cli.main(["setup"]) == 0
     assert store.load("default") == profile
     assert len(requests) == 2
+
+
+class SavedStore:
+    def __init__(self, profile, error=None):
+        self.profile, self.error = profile, error
+
+    def check_available(self):
+        if self.error:
+            raise SafeError(self.error)
+
+    def load(self, name):
+        return self.profile
+
+
+@pytest.fixture
+def saved(profile, monkeypatch):
+    store = SavedStore(profile)
+    monkeypatch.setattr(cli, "_store_for", lambda choice: store)
+    return store
+
+
+def test_serve_flags_configure_tools_default_calendar_and_deletes(saved, monkeypatch):
+    built = []
+    monkeypatch.setattr(
+        cli, "make_server", lambda service, **kw: built.append((service, kw))
+    )
+
+    async def run(server):
+        pass
+
+    monkeypatch.setattr(cli, "serve", run)
+    assert cli.main(["serve"]) == 0
+    service, options = built.pop()
+    assert options == {"tools": "lite"}
+    assert service.delete_policy is None and service.default_calendar is None
+    argv = ["serve", "--tools", "full", "--default-calendar", "Personal"]
+    argv += ["--allow-delete", "--delete-calendars", " Personal, Work ,"]
+    assert cli.main([*argv, "--max-deletes", "2"]) == 0
+    service, options = built.pop()
+    assert options == {"tools": "full"} and service.default_calendar == "Personal"
+    assert service.delete_policy.calendars == ("Personal", "Work")
+    assert service.delete_policy.max_deletes == 2
+    assert service.profile_loader() == saved.profile
+
+
+@pytest.mark.parametrize("value", ["0", "101", "many"])
+def test_max_deletes_is_bounded(saved, value, capsys):
+    with pytest.raises(SystemExit) as e:
+        cli.main(["serve", "--allow-delete", "--max-deletes", value])
+    assert e.value.code == 2
+    assert "--max-deletes" in capsys.readouterr().err
+
+
+def test_doctor_prints_checks_and_fails_on_any_failure(saved, monkeypatch, capsys):
+    results = [{"check": "calendars", "status": "warn", "detail": "No tasks."}]
+
+    async def doctor(loader):
+        assert loader() == saved.profile
+        return results
+
+    monkeypatch.setattr(cli, "run_doctor", doctor)
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "[PASS] keyring: Reachable." in out
+    assert "[WARN] calendars: No tasks." in out
+    results.append({"check": "connection", "status": "fail", "detail": "Down."})
+    assert cli.main(["doctor"]) == 1
+    saved.error = ErrorCode.CREDENTIALS_LOCKED
+    assert cli.main(["doctor"]) == 1
+    out = capsys.readouterr().out
+    assert "[FAIL] keyring: CREDENTIALS_LOCKED" in out
+    assert saved.profile.password not in out
+
+
+def test_restore_recreates_a_backup_without_overwriting(tmp_path, monkeypatch, capsys):
+    from test_server import PERSONAL, event, setup
+
+    dav, service = setup(PERSONAL)
+    monkeypatch.setattr(cli, "_service", lambda name, args: (None, service))
+    backup = tmp_path / "backup.ics"
+    backup.write_text(event("u1", "20250401T100000Z", "20250401T110000Z", "Back"))
+    assert cli.main(["restore", str(backup)]) == 0
+    assert "Restored into Personal." in capsys.readouterr().out
+    (put,) = dav.writes()
+    assert put.headers["If-None-Match"] == "*"
+    backup.write_text("not a calendar")
+    assert cli.main(["restore", str(backup)]) == 1
+    assert len(dav.writes()) == 1

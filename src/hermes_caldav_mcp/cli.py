@@ -9,10 +9,11 @@ import sys
 from . import hermes_integration, setup_helpers, setup_wizard, wallet_protection
 from .caldav import discover_calendars
 from .credentials import CredentialStore, validate_profile_name
+from .deletion import DeletePolicy
 from .preferences import load_choice, remove_choice, save_choice
-from .server import CalendarService, make_server, serve
+from .server import CalendarService, make_server, run_doctor, serve
 from .transport import CalDAVClient
-from .types import TOOL_DEADLINE, ErrorCode, SafeError
+from .types import MAX_EVENT_BYTES, TOOL_DEADLINE, ErrorCode, SafeError
 from .wallets import LABELS, WalletChoice, detect_wallets, recommended_wallet
 
 
@@ -256,6 +257,55 @@ def _setup(
     _finish_connection(name, choice, target)
 
 
+def _service(name, args):
+    choice = _configured_choice(name, args.keyring, args.keyring_executable)
+    store = _store_for(choice)
+    return store, CalendarService(
+        lambda: store.load(name),
+        default_calendar=getattr(args, "default_calendar", None),
+        delete_policy=DeletePolicy(
+            tuple(n.strip() for n in args.delete_calendars.split(",") if n.strip()),
+            args.max_deletes,
+        )
+        if getattr(args, "allow_delete", False)
+        else None,
+    )
+
+
+def _doctor(name, args):
+    try:
+        store, _ = _service(name, args)
+        store.check_available()
+        checks = [{"check": "keyring", "status": "pass", "detail": "Reachable."}]
+        checks += asyncio.run(run_doctor(lambda: store.load(name)))
+    except SafeError as error:
+        checks = [
+            {
+                "check": "keyring",
+                "status": "fail",
+                "detail": f"{error.code.value}: {error}",
+            }
+        ]
+    for check in checks:
+        print(f"[{check['status'].upper()}] {check['check']}: {check['detail']}")
+    return 1 if any(c["status"] == "fail" for c in checks) else 0
+
+
+def _restore(name, args):
+    with open(args.file, "rb") as handle:
+        data = handle.read(MAX_EVENT_BYTES + 1)
+    _, service = _service(name, args)
+    result = asyncio.run(service.restore(data, args.calendar))
+    print(f"Restored into {result['calendar']}.")
+
+
+def _positive(value):
+    number = int(value)
+    if not 1 <= number <= 100:
+        raise argparse.ArgumentTypeError("use 1 to 100")
+    return number
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Local Nextcloud calendar MCP with desktop-wallet profiles."
@@ -264,10 +314,13 @@ def main(argv=None) -> int:
     sub.add_parser(
         "wallets", help="List installed/available wallets without reading saved secrets"
     )
-    for command in ("setup", "serve", "forget", "print-config", "connect-hermes"):
+    commands = ("setup", "serve", "doctor", "restore", "forget", "print-config")
+    for command in commands + ("connect-hermes",):
         help_text = {
             "setup": "Guided account enrollment and Hermes connection",
             "serve": "Start the stdio MCP; normally launched by Hermes",
+            "doctor": "Check keyring, profile, connection, calendars and trash bin",
+            "restore": "Re-create an event or task from a delete backup (.ics)",
             "forget": "Remove the local wallet profile; revoke its app password separately",
             "print-config": "Print credential-free configuration for manual use",
             "connect-hermes": "Retry Hermes registration without reading the saved app password",
@@ -296,6 +349,41 @@ def main(argv=None) -> int:
                 "--no-hermes",
                 action="store_true",
                 help="Enroll only; print configuration instead of connecting Hermes",
+            )
+        if command == "serve":
+            p.add_argument(
+                "--tools",
+                choices=["lite", "full"],
+                default="lite",
+                help="lite (default): core tools for small models; full adds "
+                "find_free_time, update_task and custom repeat rules",
+            )
+            p.add_argument(
+                "--default-calendar",
+                help="Calendar name used when a write names none",
+            )
+            p.add_argument(
+                "--allow-delete",
+                action="store_true",
+                help="Offer delete_event/delete_task; each delete needs user "
+                "confirmation in the client and is backed up locally",
+            )
+            p.add_argument(
+                "--delete-calendars",
+                default="",
+                help='With --allow-delete: only these calendars, e.g. "Personal,Work"',
+            )
+            p.add_argument(
+                "--max-deletes",
+                type=_positive,
+                default=5,
+                help="With --allow-delete: deletes allowed per server process (default 5)",
+            )
+        if command == "restore":
+            p.add_argument("file", help="Backup file written before a delete")
+            p.add_argument(
+                "--calendar",
+                help="Target calendar name; needed when several are writable",
             )
         if command in {"setup", "connect-hermes"}:
             p.add_argument(
@@ -334,9 +422,12 @@ def main(argv=None) -> int:
                 name, choice, hermes_integration.detect_target(args.hermes_profile)
             )
         elif args.command == "serve":
-            choice = _configured_choice(name, args.keyring, args.keyring_executable)
-            store = _store_for(choice)
-            asyncio.run(serve(make_server(CalendarService(lambda: store.load(name)))))
+            _, service = _service(name, args)
+            asyncio.run(serve(make_server(service, tools=args.tools)))
+        elif args.command == "doctor":
+            return _doctor(name, args)
+        elif args.command == "restore":
+            _restore(name, args)
         elif args.command == "forget":
             choice = _configured_choice(name, args.keyring, args.keyring_executable)
             _store_for(choice).forget(name)
