@@ -131,8 +131,17 @@ def _decode(data: bytes) -> ConnectionProfile:
     if not isinstance(p["calendars"], list) or not 1 <= len(p["calendars"]) <= 100:
         raise ValueError("calendars")
     for c in p["calendars"]:
-        if set(c) != {"id", "href", "name", "writable"}:
+        # "components" was added later; profiles without it hold event calendars.
+        if set(c) - {"components"} != {"id", "href", "name", "writable"}:
             raise ValueError("calendar")
+        comps = c.get("components", ["VEVENT"])
+        if (
+            not isinstance(comps, list)
+            or not comps
+            or any(k not in ("VEVENT", "VTODO") for k in comps)
+        ):
+            raise ValueError("calendar")
+        c["components"] = tuple(dict.fromkeys(comps))
         if any(
             not isinstance(c[k], str) or len(c[k]) > 4096
             for k in ("id", "href", "name")

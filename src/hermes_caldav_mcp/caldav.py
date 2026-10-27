@@ -1,4 +1,4 @@
-"""The small DAV subset needed for selected calendar collections and VEVENTs."""
+"""The small DAV subset needed for selected calendar collections, VEVENTs and VTODOs."""
 
 import hashlib
 import re
@@ -6,11 +6,10 @@ from xml.etree import ElementTree as XML
 
 from defusedxml import ElementTree
 
-from .events import event_views, parse_calendar, validate_interval
+from .events import parse_calendar
 from .transport import event_href, event_id, strong_etag
 from .types import (
     MAX_EVENT_BYTES,
-    MAX_OCCURRENCES,
     CalendarRef,
     CalendarResource,
     ErrorCode,
@@ -19,6 +18,8 @@ from .types import (
 
 D = "DAV:"
 C = "urn:ietf:params:xml:ns:caldav"
+NC = "http://nextcloud.com/ns"
+COMPONENTS = ("VEVENT", "VTODO")
 
 
 def _tag(namespace, name):
@@ -98,6 +99,7 @@ def _propfind_body():
         (D, "displayname"),
         (D, "current-user-privilege-set"),
         (C, "supported-calendar-component-set"),
+        (NC, "trash-bin-retention-duration"),
     ):
         XML.SubElement(prop, _tag(ns, name))
     return XML.tostring(root, encoding="utf-8", xml_declaration=True)
@@ -108,7 +110,12 @@ def _calendar(href, props, failures, identifier=None):
     if rt.find(_tag(C, "calendar")) is None:
         return None
     comps = props.get(_tag(C, "supported-calendar-component-set"))
-    if comps is None or not any(c.get("name") == "VEVENT" for c in comps):
+    names = tuple(
+        n
+        for n in COMPONENTS
+        if any(c.get("name") == n for c in (() if comps is None else comps))
+    )
+    if not names:
         return None
     priv = props.get(_tag(D, "current-user-privilege-set"))
     writable = priv is not None and any(
@@ -122,12 +129,14 @@ def _calendar(href, props, failures, identifier=None):
         href,
         name[:512],
         writable,
+        names,
     )
 
 
-async def discover_calendars(client):
+async def home_status(client):
+    """One PROPFIND of the calendar home: its calendars and trash-bin details."""
     response = await client.request("PROPFIND", client.home, body=_propfind_body())
-    result, seen = [], set()
+    calendars, seen, retention, trashbin = [], set(), None, False
     for href, props, failures in _responses(response.data):
         try:
             href = client.validated_href(href, discovered=True)
@@ -136,50 +145,68 @@ async def discover_calendars(client):
         if href in seen:
             raise SafeError(ErrorCode.BAD_RESPONSE)
         seen.add(href)
+        if href == client.home:
+            value = props.get(_tag(NC, "trash-bin-retention-duration"))
+            if value is not None and (value.text or "").strip().isdigit():
+                retention = int(value.text.strip())
+            continue
+        rt = props.get(_tag(D, "resourcetype"))
+        if rt is not None and rt.find(_tag(NC, "trash-bin")) is not None:
+            trashbin = True
+            continue
         calendar = _calendar(href, props, failures)
-        if href != client.home and calendar is not None:
-            result.append(calendar)
-        if len(result) > 100:
+        if calendar is not None:
+            calendars.append(calendar)
+        if len(calendars) > 100:
             raise SafeError(ErrorCode.LIMIT_EXCEEDED)
-    return result
+    return {"calendars": calendars, "retention": retention, "trashbin": trashbin}
 
 
-async def calendar_properties(client, calendar):
-    response = await client.request("PROPFIND", calendar.href, body=_propfind_body())
-    rows = _responses(response.data)
-    if len(rows) != 1:
-        raise SafeError(ErrorCode.BAD_RESPONSE)
-    href, props, failures = rows[0]
-    if client.validated_href(href) != calendar.href:
-        raise SafeError(ErrorCode.BAD_RESPONSE)
-    result = _calendar(calendar.href, props, failures, calendar.id)
-    if result is None:
-        raise SafeError(ErrorCode.UNSUPPORTED_OPERATION)
-    return result
+async def discover_calendars(client):
+    return (await home_status(client))["calendars"]
 
 
-async def query_events(client, calendar, start, end):
-    start, end = validate_interval(start.isoformat(), end.isoformat())
-    bounds = {
-        "start": start.strftime("%Y%m%dT%H%M%SZ"),
-        "end": end.strftime("%Y%m%dT%H%M%SZ"),
-    }
+async def live_calendars(client, profile):
+    """Enrolled calendars only, with current names, privileges and components."""
+    live = {c.href: c for c in await discover_calendars(client)}
+    return [
+        CalendarRef(
+            c.id,
+            c.href,
+            live[c.href].name,
+            live[c.href].writable,
+            live[c.href].components,
+        )
+        for c in profile.calendars
+        if c.href in live
+    ]
+
+
+def _query_body(component, start=None, end=None):
     root = XML.Element(_tag(C, "calendar-query"))
     prop = XML.SubElement(root, _tag(D, "prop"))
     XML.SubElement(prop, _tag(D, "getetag"))
-    data = XML.SubElement(prop, _tag(C, "calendar-data"))
-    XML.SubElement(data, _tag(C, "expand"), bounds)
+    XML.SubElement(prop, _tag(C, "calendar-data"))
     filt = XML.SubElement(root, _tag(C, "filter"))
     vc = XML.SubElement(filt, _tag(C, "comp-filter"), name="VCALENDAR")
-    ve = XML.SubElement(vc, _tag(C, "comp-filter"), name="VEVENT")
-    XML.SubElement(ve, _tag(C, "time-range"), bounds)
+    comp = XML.SubElement(vc, _tag(C, "comp-filter"), name=component)
+    if start is not None:
+        # Unexpanded resources keep their TZIDs; recurrences expand locally.
+        bounds = {
+            "start": start.strftime("%Y%m%dT%H%M%SZ"),
+            "end": end.strftime("%Y%m%dT%H%M%SZ"),
+        }
+        XML.SubElement(comp, _tag(C, "time-range"), bounds)
+    return XML.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+async def query_resources(client, calendar, component="VEVENT", start=None, end=None):
+    """Matching resources; ones that cannot be parsed come back with data=None."""
     response = await client.request(
-        "REPORT",
-        calendar.href,
-        body=XML.tostring(root, encoding="utf-8", xml_declaration=True),
+        "REPORT", calendar.href, body=_query_body(component, start, end)
     )
-    resources, seen, count = [], set(), 0
-    for href, props, failures in _responses(response.data):
+    resources, seen = [], set()
+    for href, props, _failures in _responses(response.data):
         try:
             href = client.validated_href(href)
             identifier = event_id(calendar, href)
@@ -188,32 +215,26 @@ async def query_events(client, calendar, start, end):
         if href in seen:
             raise SafeError(ErrorCode.BAD_RESPONSE)
         seen.add(href)
-        data = (
-            _required(props, failures, _tag(C, "calendar-data")).text or ""
-        ).encode()
+        element = props.get(_tag(C, "calendar-data"))
+        data = (element.text or "").encode() if element is not None else b""
         etag_prop = props.get(_tag(D, "getetag"))
         etag = etag_prop.text if etag_prop is not None else None
-        resource = CalendarResource(
-            identifier, href, etag if strong_etag(etag) else None, data
+        try:
+            parse_calendar(data, component)
+        except SafeError:
+            data = None
+        resources.append(
+            CalendarResource(
+                identifier, href, etag if strong_etag(etag) else None, data
+            )
         )
-        parsed = parse_calendar(data)
-        if any(
-            k in e for e in parsed.walk("VEVENT") for k in ("RRULE", "RDATE", "EXDATE")
-        ):
-            raise SafeError(ErrorCode.UNSUPPORTED_OPERATION)
-        count += len(
-            event_views(resource, client.profile.default_timezone, minimal=True)
-        )
-        if count > MAX_OCCURRENCES:
-            raise SafeError(ErrorCode.LIMIT_EXCEEDED)
-        resources.append(resource)
     return resources
 
 
-async def get_resource(client, calendar, identifier):
+async def get_resource(client, calendar, identifier, component="VEVENT"):
     href = event_href(calendar, identifier)
     result = await client.request("GET", href, max_bytes=MAX_EVENT_BYTES)
-    parse_calendar(result.data)
+    parse_calendar(result.data, component)
     return CalendarResource(identifier, href, result.etag, result.data)
 
 
@@ -251,3 +272,12 @@ async def update_resource(client, calendar, resource, expected_revision, data):
         max_bytes=MAX_EVENT_BYTES,
     )
     return {"event_id": resource.event_id, "revision": result.etag, "updated": True}
+
+
+async def delete_resource(client, calendar, resource):
+    if (
+        not strong_etag(resource.etag)
+        or event_href(calendar, resource.event_id) != resource.href
+    ):
+        raise SafeError(ErrorCode.CONFLICT)
+    await client.request("DELETE", resource.href, expected_revision=resource.etag)

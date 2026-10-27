@@ -183,23 +183,36 @@ class CalDAVClient:
         max_bytes=MAX_DAV_BYTES,
     ) -> HTTPResult:
         if (
-            method not in {"PROPFIND", "REPORT", "GET", "PUT"}
+            method not in {"PROPFIND", "REPORT", "GET", "PUT", "DELETE"}
             or not 1 <= max_bytes <= MAX_DAV_BYTES
         ):
             raise SafeError(ErrorCode.INVALID_INPUT)
-        resource = self.validated_href(href, discovered=self.discovery)
+        # The home itself is only ever listed (Depth 1) to read live privileges.
+        home = (
+            method == "PROPFIND"
+            and self.validated_href(href, discovered=True) == self.home
+        )
+        resource = (
+            self.home if home else self.validated_href(href, discovered=self.discovery)
+        )
         if self.discovery:
-            if method != "PROPFIND" or resource != self.home:
+            if not home:
                 raise SafeError(ErrorCode.INVALID_INPUT)
         elif (method in {"REPORT", "PROPFIND"}) != resource.endswith("/"):
             raise SafeError(ErrorCode.INVALID_INPUT)
-        if method != "PUT" and (create or expected_revision is not None):
+        if method != "PUT" and (
+            create or (method != "DELETE" and expected_revision is not None)
+        ):
+            raise SafeError(ErrorCode.INVALID_INPUT)
+        if method == "DELETE" and not strong_etag(expected_revision):
             raise SafeError(ErrorCode.INVALID_INPUT)
         headers = {"Accept-Encoding": "identity"}
+        if method == "DELETE":
+            headers["If-Match"] = expected_revision
         if method == "PROPFIND":
             headers.update(
                 {
-                    "Depth": "1" if self.discovery else "0",
+                    "Depth": "1" if home else "0",
                     "Content-Type": "application/xml; charset=utf-8",
                 }
             )
@@ -217,7 +230,7 @@ class CalDAVClient:
                 "*" if create else expected_revision
             )
         try:
-            if method == "PUT":
+            if method in {"PUT", "DELETE"}:
                 self.write_started = True
             async with self.http.stream(
                 method,
@@ -240,13 +253,14 @@ class CalDAVClient:
                     "REPORT": {207},
                     "GET": {200},
                     "PUT": {200, 201, 204},
+                    "DELETE": {200, 204},
                 }
                 if status not in allowed[method]:
-                    if method == "PUT" and status >= 500:
+                    if method in {"PUT", "DELETE"} and status >= 500:
                         raise SafeError(ErrorCode.UNKNOWN_WRITE_OUTCOME)
                     raise SafeError(ErrorCode.BAD_RESPONSE)
                 etag = response.headers.get("ETag")
-                if method == "PUT":
+                if method in {"PUT", "DELETE"}:
                     # Status and ETag suffice. Consuming an unused response body
                     # could turn an acknowledged write into a false failure.
                     return HTTPResult(status, b"", etag if strong_etag(etag) else None)
@@ -277,6 +291,6 @@ class CalDAVClient:
         except httpx.HTTPError:
             raise SafeError(
                 ErrorCode.UNKNOWN_WRITE_OUTCOME
-                if method == "PUT"
+                if method in {"PUT", "DELETE"}
                 else ErrorCode.NETWORK_ERROR
             ) from None

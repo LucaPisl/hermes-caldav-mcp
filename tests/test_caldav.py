@@ -1,18 +1,22 @@
 from dataclasses import replace
 from pathlib import Path
 from xml.etree import ElementTree as ET
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
 
 from hermes_caldav_mcp.caldav import (
     create_resource,
+    delete_resource,
     discover_calendars,
     get_resource,
-    query_events,
+    home_status,
+    live_calendars,
+    query_resources,
     update_resource,
 )
-from hermes_caldav_mcp.events import validate_interval
+from hermes_caldav_mcp.events import parse_range
 from hermes_caldav_mcp.transport import CalDAVClient, event_id
 from hermes_caldav_mcp.types import CalendarResource, SafeError
 
@@ -89,6 +93,7 @@ async def test_created_resource_can_have_no_new_revision(profile):
 
 D = "DAV:"
 C = "urn:ietf:params:xml:ns:caldav"
+NC = "http://nextcloud.com/ns"
 SIMPLE = (Path(__file__).parent / "fixtures/simple.ics").read_text()
 
 
@@ -99,7 +104,7 @@ def multistatus(
     status="HTTP/1.1 200 OK",
     calendar=False,
     writable=True,
-    expand=None,
+    components=("VEVENT",),
 ):
     root = ET.Element(f"{{{D}}}multistatus")
     response = ET.SubElement(root, f"{{{D}}}response")
@@ -112,7 +117,8 @@ def multistatus(
         ET.SubElement(rt, f"{{{C}}}calendar")
         ET.SubElement(prop, f"{{{D}}}displayname").text = "Synthetic calendar"
         comps = ET.SubElement(prop, f"{{{C}}}supported-calendar-component-set")
-        ET.SubElement(comps, f"{{{C}}}comp", name="VEVENT")
+        for name in components:
+            ET.SubElement(comps, f"{{{C}}}comp", name=name)
         privs = ET.SubElement(prop, f"{{{D}}}current-user-privilege-set")
         if writable:
             p = ET.SubElement(privs, f"{{{D}}}privilege")
@@ -150,7 +156,11 @@ async def test_discovery_is_scoped_and_conservative(profile):
     assert str(seen[0].url).endswith(profile.calendar_home)
 
 
-async def test_query_emits_bounded_utc_filter_and_retains_revision(profile):
+RANGE = parse_range("2025-03-01T00:00:00Z", "2025-04-01T00:00:00Z", ZoneInfo("UTC"))
+TASK = SIMPLE.replace("BEGIN:VEVENT", "BEGIN:VTODO").replace("END:VEVENT", "END:VTODO")
+
+
+async def test_query_emits_bounded_utc_filter_without_server_expansion(profile):
     seen = []
     cal = profile.calendars[0]
 
@@ -158,103 +168,157 @@ async def test_query_emits_bounded_utc_filter_and_retains_revision(profile):
         seen.append(r)
         return httpx.Response(207, content=multistatus(cal.href + "a.ics", data=SIMPLE))
 
-    start, end = validate_interval("2025-03-01T00:00:00Z", "2025-04-01T00:00:00Z")
     async with CalDAVClient(profile, transport=httpx.MockTransport(handler)) as client:
-        resources = await query_events(client, cal, start, end)
+        resources = await query_resources(client, cal, "VEVENT", *RANGE)
     assert resources[0].etag == '"rev1"'
     assert resources[0].event_id == event_id(cal, cal.href + "a.ics")
+    assert resources[0].data == SIMPLE.encode()
     xml = ET.fromstring(seen[0].content)
-    assert xml.find(f".//{{{C}}}expand").attrib == {
-        "start": "20250301T000000Z",
-        "end": "20250401T000000Z",
-    }
+    # Recurrences are expanded locally so the original TZIDs survive.
+    assert xml.find(f".//{{{C}}}expand") is None
     assert xml.find(f".//{{{C}}}time-range").attrib == {
         "start": "20250301T000000Z",
         "end": "20250401T000000Z",
     }
+    filters = [e.get("name") for e in xml.iter(f"{{{C}}}comp-filter")]
+    assert filters == ["VCALENDAR", "VEVENT"]
+
+
+async def test_task_query_is_unbounded_and_filters_vtodo(profile):
+    seen = []
+    cal = profile.calendars[0]
+
+    def handler(r):
+        seen.append(r)
+        return httpx.Response(207, content=multistatus(cal.href + "t.ics", data=TASK))
+
+    async with CalDAVClient(profile, transport=httpx.MockTransport(handler)) as client:
+        resources = await query_resources(client, cal, "VTODO")
+    assert resources[0].data == TASK.encode()
+    xml = ET.fromstring(seen[0].content)
+    assert xml.find(f".//{{{C}}}time-range") is None
+    assert [e.get("name") for e in xml.iter(f"{{{C}}}comp-filter")][1] == "VTODO"
 
 
 @pytest.mark.parametrize(
-    "payload,code",
+    "data,status",
     [
-        (
-            b'<!DOCTYPE x [<!ENTITY y SYSTEM "file:///etc/passwd">]><x>&y;</x>',
-            "BAD_RESPONSE",
-        ),
-        (
-            multistatus("https://foreign.example.test/a.ics", data=SIMPLE),
-            "BAD_RESPONSE",
-        ),
-        (multistatus("/wrong/a.ics", data=SIMPLE), "BAD_RESPONSE"),
-        (
-            multistatus(
-                "/nextcloud/remote.php/dav/calendars/calendar-user/personal/a.ics",
-                data=SIMPLE,
-                status="HTTP/1.1 403 Forbidden",
-            ),
-            "PERMISSION_DENIED",
-        ),
-        (
-            multistatus(
-                "/nextcloud/remote.php/dav/calendars/calendar-user/personal/a.ics",
-                data=SIMPLE.replace("SUMMARY:", "RRULE:FREQ=DAILY\nSUMMARY:"),
-            ),
-            "UNSUPPORTED_OPERATION",
-        ),
+        ("garbage", "HTTP/1.1 200 OK"),
+        (SIMPLE.replace("UID:synthetic-event", "UID:a\nUID:b"), "HTTP/1.1 200 OK"),
+        (SIMPLE, "HTTP/1.1 403 Forbidden"),
     ],
 )
-async def test_hostile_or_failed_dav_response_fails(profile, payload, code):
-    start, end = validate_interval("2025-03-01T00:00:00Z", "2025-04-01T00:00:00Z")
+async def test_unreadable_resource_is_returned_without_data(profile, data, status):
+    cal = profile.calendars[0]
+    payload = multistatus(cal.href + "a.ics", data=data, status=status)
+    async with CalDAVClient(
+        profile,
+        transport=httpx.MockTransport(lambda r: httpx.Response(207, content=payload)),
+    ) as client:
+        resources = await query_resources(client, cal, "VEVENT", *RANGE)
+    assert len(resources) == 1 and resources[0].data is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'<!DOCTYPE x [<!ENTITY y SYSTEM "file:///etc/passwd">]><x>&y;</x>',
+        multistatus("https://foreign.example.test/a.ics", data=SIMPLE),
+        multistatus("/wrong/a.ics", data=SIMPLE),
+    ],
+)
+async def test_hostile_dav_response_fails(profile, payload):
     async with CalDAVClient(
         profile,
         transport=httpx.MockTransport(lambda r: httpx.Response(207, content=payload)),
     ) as client:
         with pytest.raises(SafeError) as caught:
-            await query_events(client, profile.calendars[0], start, end)
-    assert caught.value.code.value == code
+            await query_resources(client, profile.calendars[0], "VEVENT", *RANGE)
+    assert caught.value.code.value == "BAD_RESPONSE"
 
 
-@pytest.mark.parametrize("count,passes", [(250, True), (251, False)])
-async def test_occurrence_limit_counts_instances_within_resource(
-    profile, count, passes
-):
-    event = SIMPLE.split("BEGIN:VEVENT\n", 1)[1].split("END:VEVENT", 1)[0]
-    data = (
-        "BEGIN:VCALENDAR\nVERSION:2.0\n"
-        + "".join(
-            "BEGIN:VEVENT\n"
-            + event.replace(
-                "UID:synthetic-event",
-                "UID:synthetic-event\nRECURRENCE-ID:20250329T100000Z",
-            )
-            + "END:VEVENT\n"
-            for _ in range(count)
+def home_listing(profile, *, retention="2592000", writable=False):
+    home = profile.calendar_home
+    root = ET.fromstring(
+        multistatus(
+            profile.calendars[0].href,
+            calendar=True,
+            writable=writable,
+            components=("VEVENT", "VTODO"),
         )
-        + "END:VCALENDAR\n"
     )
-    # Each synthetic instance must have a distinct recurrence ID.
-    for i in range(count):
-        data = data.replace(
-            "RECURRENCE-ID:20250329T100000Z",
-            f"RECURRENCE-ID:20250329T10{i // 60:02}{i % 60:02}Z",
-            1,
-        )
-    cal = profile.calendars[0]
-    start, end = validate_interval("2025-03-01T00:00:00Z", "2025-04-01T00:00:00Z")
-    async with CalDAVClient(
+    for href, kind in ((home, None), (home + "trashbin/", "trash-bin")):
+        response = ET.SubElement(root, f"{{{D}}}response")
+        ET.SubElement(response, f"{{{D}}}href").text = href
+        ps = ET.SubElement(response, f"{{{D}}}propstat")
+        prop = ET.SubElement(ps, f"{{{D}}}prop")
+        ET.SubElement(ps, f"{{{D}}}status").text = "HTTP/1.1 200 OK"
+        rt = ET.SubElement(prop, f"{{{D}}}resourcetype")
+        ET.SubElement(rt, f"{{{D}}}collection")
+        if kind:
+            ET.SubElement(rt, f"{{{NC}}}{kind}")
+        elif retention is not None:
+            ET.SubElement(
+                prop, f"{{{NC}}}trash-bin-retention-duration"
+            ).text = retention
+    return ET.tostring(root)
+
+
+async def test_home_status_reports_trash_bin_and_live_privileges(profile):
+    seen = []
+
+    def handler(r):
+        seen.append(r)
+        return httpx.Response(207, content=home_listing(profile))
+
+    async with CalDAVClient(profile, transport=httpx.MockTransport(handler)) as client:
+        status = await home_status(client)
+        live = await live_calendars(client, profile)
+    assert status["retention"] == 2592000 and status["trashbin"] is True
+    assert [c.components for c in status["calendars"]] == [("VEVENT", "VTODO")]
+    # The enrolled id is kept, but privileges come from the server, not the profile.
+    assert live[0].id == "calendar-1" and live[0].writable is False
+    assert live[0].name == "Synthetic calendar"
+    assert seen[0].headers["Depth"] == "1"
+    assert str(seen[0].url).endswith(profile.calendar_home)
+
+
+async def test_unenrolled_live_calendars_are_ignored(profile):
+    other = replace(
         profile,
+        calendars=(replace(profile.calendars[0], href=profile.calendar_home + "x/"),),
+    )
+    async with CalDAVClient(
+        other,
         transport=httpx.MockTransport(
-            lambda r: httpx.Response(
-                207, content=multistatus(cal.href + "a.ics", data=data)
-            )
+            lambda r: httpx.Response(207, content=home_listing(profile))
         ),
     ) as client:
-        if passes:
-            assert len(await query_events(client, cal, start, end)) == 1
-        else:
-            with pytest.raises(SafeError) as caught:
-                await query_events(client, cal, start, end)
-            assert caught.value.code.value == "LIMIT_EXCEEDED"
+        assert await live_calendars(client, other) == []
+
+
+async def test_delete_is_conditional_and_maps_conflict(profile):
+    cal = profile.calendars[0]
+    href = cal.href + "a.ics"
+    resource = CalendarResource(event_id(cal, href), href, '"rev1"', SIMPLE.encode())
+    seen = []
+
+    def handler(r):
+        seen.append(r)
+        return httpx.Response(204 if len(seen) == 1 else 412)
+
+    async with CalDAVClient(profile, transport=httpx.MockTransport(handler)) as client:
+        await delete_resource(client, cal, resource)
+        with pytest.raises(SafeError) as caught:
+            await delete_resource(client, cal, resource)
+        assert caught.value.code.value == "CONFLICT"
+        weak = replace(resource, etag='W/"rev1"')
+        with pytest.raises(SafeError):
+            await delete_resource(client, cal, weak)
+        with pytest.raises(SafeError):
+            await client.request("DELETE", href)
+    assert [r.method for r in seen] == ["DELETE", "DELETE"]
+    assert seen[0].headers["If-Match"] == '"rev1"'
 
 
 async def test_get_fetches_only_one_validated_resource(profile):

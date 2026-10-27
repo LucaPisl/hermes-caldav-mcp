@@ -120,3 +120,27 @@ def test_runtime_bus_can_use_nonsecret_user_socket_without_env(monkeypatch):
     assert seen[0][0].startswith("unix:path=/run/user/")
     assert seen[0][0].endswith("/bus")
     assert seen[0][1] <= 10
+
+
+def test_calendar_components_round_trip_and_old_profiles_default_to_events(
+    profile, collection
+):
+    from dataclasses import replace
+
+    store = CredentialStore(lambda: collection)
+    tasks = replace(profile.calendars[0], components=("VEVENT", "VTODO"))
+    store.save(
+        "default",
+        replace(profile, calendars=(tasks,)),
+        verified_encryption=True,
+    )
+    assert store.load("default").calendars[0].components == ("VEVENT", "VTODO")
+    data = json.loads(collection.items[0].secret)
+    del data["profile"]["calendars"][0]["components"]
+    collection.items[0].secret = json.dumps(data).encode()
+    assert store.load("default").calendars[0].components == ("VEVENT",)
+    for bad in ([], ["VJOURNAL"], "VEVENT"):
+        data["profile"]["calendars"][0]["components"] = bad
+        collection.items[0].secret = json.dumps(data).encode()
+        with pytest.raises(SafeError):
+            store.load("default")
