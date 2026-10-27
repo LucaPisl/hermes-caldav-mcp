@@ -1,10 +1,10 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'emscripten'",
-    "(python_full_version < '3.14' and sys_platform != 'emscripten') or (python_full_version < '3.12' and sys_platform == 'emscripten')",
+    "python_full_version < '3.12' or (python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform != 'emscripten')",
 ]
 
 [[package]]
@@ -245,7 +245,9 @@ dependencies = [
     { name = "defusedxml" },
     { name = "httpx" },
     { name = "icalendar" },
+    { name = "jeepney" },
     { name = "mcp" },
+    { name = "python-dateutil" },
     { name = "secretstorage" },
 ]
 
@@ -261,7 +263,9 @@ requires-dist = [
     { name = "defusedxml", specifier = ">=0.7,<1" },
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "icalendar", specifier = ">=6,<8" },
+    { name = "jeepney", specifier = ">=0.6,<1" },
     { name = "mcp", specifier = ">=2.2,<3" },
+    { name = "python-dateutil", specifier = ">=2.8,<3" },
     { name = "secretstorage", specifier = ">=3.3,<4" },
 ]
 
