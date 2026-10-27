@@ -56,14 +56,15 @@ class FakeDAV:
         prop = _response(root, HOME)
         rt = ET.SubElement(prop, f"{{{D}}}resourcetype")
         ET.SubElement(rt, f"{{{D}}}collection")
-        if self.retention is not None:
-            ET.SubElement(
-                prop, f"{{{NC}}}trash-bin-retention-duration"
-            ).text = self.retention
         if self.trashbin:
+            # Like Nextcloud: the retention is a property of the trash-bin collection.
             prop = _response(root, HOME + "trashbin/")
             rt = ET.SubElement(prop, f"{{{D}}}resourcetype")
             ET.SubElement(rt, f"{{{NC}}}trash-bin")
+            if self.retention is not None:
+                ET.SubElement(
+                    prop, f"{{{NC}}}trash-bin-retention-duration"
+                ).text = self.retention
         for cal in self.calendars:
             prop = _response(root, cal.href)
             rt = ET.SubElement(prop, f"{{{D}}}resourcetype")

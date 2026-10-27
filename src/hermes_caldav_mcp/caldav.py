@@ -145,14 +145,14 @@ async def home_status(client):
         if href in seen:
             raise SafeError(ErrorCode.BAD_RESPONSE)
         seen.add(href)
-        if href == client.home:
+        rt = props.get(_tag(D, "resourcetype"))
+        is_trashbin = rt is not None and rt.find(_tag(NC, "trash-bin")) is not None
+        if href == client.home or is_trashbin:
+            # Nextcloud reports the retention on the trash-bin collection; accept the home too.
             value = props.get(_tag(NC, "trash-bin-retention-duration"))
             if value is not None and (value.text or "").strip().isdigit():
                 retention = int(value.text.strip())
-            continue
-        rt = props.get(_tag(D, "resourcetype"))
-        if rt is not None and rt.find(_tag(NC, "trash-bin")) is not None:
-            trashbin = True
+            trashbin = trashbin or is_trashbin
             continue
         calendar = _calendar(href, props, failures)
         if calendar is not None:

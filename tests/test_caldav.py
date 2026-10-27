@@ -255,9 +255,10 @@ def home_listing(profile, *, retention="2592000", writable=False):
         ET.SubElement(ps, f"{{{D}}}status").text = "HTTP/1.1 200 OK"
         rt = ET.SubElement(prop, f"{{{D}}}resourcetype")
         ET.SubElement(rt, f"{{{D}}}collection")
+        # Nextcloud reports the retention on the trash-bin collection, not the home.
         if kind:
             ET.SubElement(rt, f"{{{NC}}}{kind}")
-        elif retention is not None:
+        if kind and retention is not None:
             ET.SubElement(
                 prop, f"{{{NC}}}trash-bin-retention-duration"
             ).text = retention
