@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from enum import Enum
 
-MAX_QUERY_DAYS = 93
+MAX_QUERY_DAYS = 366
 MAX_OCCURRENCES = 250
 MAX_DAV_BYTES = 2097152
 MAX_EVENT_BYTES = 262144
@@ -25,6 +25,7 @@ class ErrorCode(str, Enum):
     NETWORK_ERROR = "NETWORK_ERROR"
     UNKNOWN_WRITE_OUTCOME = "UNKNOWN_WRITE_OUTCOME"
     INTERNAL_ERROR = "INTERNAL_ERROR"
+    NOT_DELETED = "NOT_DELETED"
 
 
 MESSAGES = {
@@ -42,13 +43,18 @@ MESSAGES = {
     ErrorCode.NETWORK_ERROR: "The calendar request failed. Check connectivity and TLS.",
     ErrorCode.UNKNOWN_WRITE_OUTCOME: "The write outcome is unknown. Read the calendar before attempting another write.",
     ErrorCode.INTERNAL_ERROR: "The calendar operation could not be completed.",
+    ErrorCode.NOT_DELETED: "Not deleted:",
 }
 
 
 class SafeError(Exception):
-    def __init__(self, code: ErrorCode):
+    """A fixed message plus an optional hint built only from field names and
+    the caller's own (truncated) input, never from secrets or server data."""
+
+    def __init__(self, code: ErrorCode, hint: str | None = None):
         self.code = code
-        super().__init__(MESSAGES[code])
+        self.hint = hint
+        super().__init__(MESSAGES[code] + (f" {hint}" if hint else ""))
 
 
 @dataclass(frozen=True, repr=False)
@@ -57,6 +63,7 @@ class CalendarRef:
     href: str
     name: str
     writable: bool
+    components: tuple[str, ...] = ("VEVENT",)
 
 
 @dataclass(frozen=True, repr=False)
@@ -89,11 +96,13 @@ class CalendarResource:
 class EventFields:
     title: str
     start: str
-    end: str
-    all_day: bool = False
+    end: str | None = None
+    duration_minutes: int | None = None
     timezone: str | None = None
     description: str = ""
     location: str = ""
+    repeat: dict | None = None
+    reminder_minutes: list[int] | None = None
 
 
 @dataclass(frozen=True, repr=False)
@@ -101,6 +110,19 @@ class EventPatch:
     title: str | None = None
     start: str | None = None
     end: str | None = None
+    duration_minutes: int | None = None
     timezone: str | None = None
     description: str | None = None
     location: str | None = None
+    repeat: dict | None = None
+    reminder_minutes: list[int] | None = None
+
+
+@dataclass(frozen=True, repr=False)
+class TaskPatch:
+    title: str | None = None
+    due: str | None = None
+    notes: str | None = None
+    priority: str | None = None
+    completed: bool | None = None
+    timezone: str | None = None
