@@ -1,6 +1,6 @@
 # Security and privacy
 
-This is a local Linux stdio MCP for selected Nextcloud calendars. Its scope is reading events, creating non-recurring events and conditionally editing supported fields. It does not implement deletion, scheduling, invitations, arbitrary HTTP requests, raw ICS submission or remote credential enrollment.
+This is a local Linux stdio MCP for selected Nextcloud calendars. Its scope is reading, creating and conditionally editing events and tasks. Deletion is off by default; with `--allow-delete` each delete needs a fresh read, human confirmation through MCP elicitation, a local 0600 backup and `If-Match`, and fails closed otherwise. It does not implement scheduling, invitations, arbitrary HTTP requests, raw ICS submission or remote credential enrollment.
 
 ## Protected storage
 
@@ -22,7 +22,7 @@ Authenticated requests use verified HTTPS and configured certificates, never an 
 
 Byte, occurrence and date-window limits protect the client. XML rejects DTDs/entities/external references. Compressed calendar response bodies are refused to avoid unbounded decompression; unused write acknowledgement bodies are not consumed. HTTP and DAV property statuses are checked explicitly. Expected failures return fixed redacted errors; no raw provider responses, headers, profiles or tracebacks are forwarded. Runtime file logging is unavailable.
 
-Creates use generated UIDs and `If-None-Match: *`. Edits use full original resources and `If-Match` with a strong revision, retaining unrelated properties/components. Invitation-managed resources and unsupported recurrence changes fail safely. Writes are never automatically repeated. A timeout/cancellation after a write starts can leave an unknown outcome: read before attempting another write.
+Creates use generated UIDs and `If-None-Match: *`. Edits use full original resources and `If-Match` with a strong revision, retaining unrelated properties/components. Invitation-managed resources fail safely; repeating events need an explicit edit scope, and whole series are never deleted. Writes are never automatically repeated. A timeout/cancellation after a write starts can leave an unknown outcome: read before attempting another write.
 
 Use a dedicated Nextcloud account with only the selected shared calendars, plus a dedicated revocable app password. A primary-account app password is not calendar scoped. Nextcloud write permission includes deletion authority even though this MCP omits deletion. Local allowlisting limits this application, not the account's underlying rights.
 
